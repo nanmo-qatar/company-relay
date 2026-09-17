@@ -1,31 +1,23 @@
 """
 Company announcement relay -- instant Telegram-to-Telegram translation.
+Powered by Sarvam AI (purpose-built for Indian languages).
 ------------------------------------------------------------------------
 The boss posts in English in one "source" channel. This webhook fires
 the moment that happens, translates the message into Hindi, Urdu,
 Nepali, and Bengali, and posts each version to its own dedicated
 channel -- instantly, no polling.
 
-Since everything happens inside Telegram, media (photos/videos) don't
-need external URLs -- Telegram lets a bot resend a file it has already
-seen using its file_id, so images are relayed directly.
+Uses Sarvam's sarvam-translate:v1 model, which covers all 22 scheduled
+Indian languages (mayura:v1 does NOT support Nepali or Urdu).
 
 Required environment variables:
-  TELEGRAM_BOT_TOKEN    - token for THIS dedicated bot (from @BotFather)
+  TELEGRAM_BOT_TOKEN     - token for THIS dedicated bot (from @BotFather)
   SOURCE_CHANNEL_ID      - the boss's channel ("@name" or numeric -100... ID)
-  LANGBLY_URL            - your langbly translate endpoint (full URL)
-  LANGBLY_API_KEY        - langbly auth key
+  SARVAM_API_KEY         - your Sarvam API subscription key
   TELEGRAM_CHAT_ID_HI    - Hindi channel
   TELEGRAM_CHAT_ID_UR    - Urdu channel
   TELEGRAM_CHAT_ID_NE    - Nepali channel
   TELEGRAM_CHAT_ID_BN    - Bengali channel
-
-Known limitation: if the boss posts multiple photos at once (an
-"album"), Telegram delivers each photo as a separate update sharing a
-media_group_id. This script relays each photo individually rather than
-regrouping them -- fine for single-image posts (the common case), but
-a multi-photo album will arrive as several separate messages in the
-target channels instead of one grouped album.
 """
 
 import json
@@ -35,11 +27,17 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
 
-LANGUAGE_CODE_CANDIDATES = {
-    "hi": ["hi", "hi-IN", "hin", "Hindi"],
-    "ur": ["ur", "ur-PK", "urd", "Urdu"],
-    "ne": ["ne", "ne-NP", "nep", "Nepali"],
-    "bn": ["bn", "bn-BD", "ben", "Bengali"],
+SARVAM_URL = "https://api.sarvam.ai/translate"
+SARVAM_MODEL = "sarvam-translate:v1"  # covers all 22 languages incl. Nepali + Urdu
+SOURCE_LANG = "en-IN"
+MAX_CHARS = 1900  # Sarvam caps at 2000 per request; leave a little headroom
+
+# Sarvam's documented language codes -- no guessing needed.
+TARGET_LANGS = {
+    "hi": "hi-IN",  # Hindi
+    "ur": "ur-IN",  # Urdu
+    "ne": "ne-IN",  # Nepali
+    "bn": "bn-IN",  # Bengali
 }
 
 
@@ -52,31 +50,50 @@ def target_channels() -> dict:
     }
 
 
-def translate(text: str, target: str) -> str:
-    resp = requests.post(
-        os.environ["LANGBLY_URL"],
-        headers={
-            "Authorization": f"Bearer {os.environ['LANGBLY_API_KEY']}",
-            "Content-Type": "application/json",
-        },
-        json={"q": text, "source": "en", "target": target},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()["data"]["translations"][0]["translatedText"]
+def _chunk(text: str, size: int = MAX_CHARS) -> list[str]:
+    """Split long text on paragraph boundaries where possible, so each
+    piece fits under Sarvam's per-request character limit."""
+    if len(text) <= size:
+        return [text]
+    chunks, current = [], ""
+    for para in text.split("\n"):
+        if len(current) + len(para) + 1 <= size:
+            current = f"{current}\n{para}" if current else para
+        else:
+            if current:
+                chunks.append(current)
+            while len(para) > size:  # a single giant paragraph -- hard split
+                chunks.append(para[:size])
+                para = para[size:]
+            current = para
+    if current:
+        chunks.append(current)
+    return chunks
 
 
-def translate_with_fallback(text: str, lang: str) -> str:
-    for code in LANGUAGE_CODE_CANDIDATES.get(lang, [lang]):
-        try:
-            result = translate(text, code)
-        except Exception as e:
-            print(f"langbly code {code!r} for {lang!r} failed: {e}", file=sys.stderr)
-            continue
-        if result.strip() != text.strip():
-            return result
-    print(f"WARNING: no working langbly code for {lang!r}, using original", file=sys.stderr)
-    return text
+def translate(text: str, lang_key: str) -> str:
+    """Translate English text into the given language via Sarvam."""
+    target = TARGET_LANGS[lang_key]
+    pieces = []
+    for chunk in _chunk(text):
+        resp = requests.post(
+            SARVAM_URL,
+            headers={
+                "api-subscription-key": os.environ["SARVAM_API_KEY"],
+                "Content-Type": "application/json",
+            },
+            json={
+                "input": chunk,
+                "source_language_code": SOURCE_LANG,
+                "target_language_code": target,
+                "model": SARVAM_MODEL,
+                "mode": "formal",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        pieces.append(resp.json()["translated_text"])
+    return "\n".join(pieces)
 
 
 def tg_call(method: str, payload: dict) -> dict:
@@ -133,10 +150,10 @@ def process_update(update: dict) -> None:
     if not post:
         return  # not a channel post (e.g. a private DM to the bot) -- ignore
 
-    chat_id = str(post["chat"]["id"])
+    posted_in = str(post["chat"]["id"])
     source = os.environ["SOURCE_CHANNEL_ID"].lstrip("@")
-    if chat_id != source and chat_id != f"@{source}":
-        return  # a post from some other channel this bot happens to admin -- ignore
+    if posted_in != source and posted_in != f"@{source}":
+        return  # a post from some other channel this bot admins -- ignore
 
     text = post.get("text") or post.get("caption") or ""
     if not text.strip():
@@ -144,12 +161,16 @@ def process_update(update: dict) -> None:
 
     media = extract_media(post)
 
-    for lang, chat_id in target_channels().items():
-        translated = translate_with_fallback(text, lang)
+    for lang_key, chat_id in target_channels().items():
+        try:
+            translated = translate(text, lang_key)
+        except Exception as e:
+            print(f"Sarvam translation to {lang_key} failed: {e}", file=sys.stderr)
+            translated = text  # fall back to the original rather than dropping it
         try:
             send_to_channel(chat_id, translated, media)
         except Exception as e:
-            print(f"Send to {lang} channel failed: {e}", file=sys.stderr)
+            print(f"Send to {lang_key} channel failed: {e}", file=sys.stderr)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -169,6 +190,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Company relay webhook is running.")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
 
 if __name__ == "__main__":
